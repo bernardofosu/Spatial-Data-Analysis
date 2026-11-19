@@ -1,0 +1,914 @@
+---
+title: "West Midlands EFDI — Spatial Weights and Moran's I"
+author: "Bernard Ofosu"
+date: "19 November 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+---
+
+# 1. Project overview
+
+This analysis examines spatial autocorrelation in the E-food Desert Index (EFDI) across 2,365 Lower Layer Super Output Areas (LSOAs) in the West Midlands, England.
+
+Four spatial weighting methods are constructed and compared:
+
+1. Queen contiguity
+2. K-nearest neighbours (KNN6)
+3. Distance band (6 km)
+4. Inverse distance (6 km, power 1)
+
+The analysis examines neighbour structures, spatial weights, Global Moran's I, Local Moran's I, spatial patterns and descriptive statistics.
+
+**Input:** `efdi_wm_clean.gpkg`
+
+**Identifier:** `lsoa01cd`
+
+**Geometry column:** `geom`
+
+**Analysis CRS:** EPSG:27700 — OSGB36 / British National Grid.
+
+# 2. Install and load packages
+
+```{r packages, message=FALSE, warning=FALSE}
+packages <- c(
+  "sf",
+  "spdep",
+  "spatialreg",
+  "dplyr",
+  "ggplot2",
+  "tidyr",
+  "purrr",
+  "knitr"
+)
+
+missing_packages <- packages[
+  !packages %in% rownames(installed.packages())
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+library(sf)
+library(spdep)
+library(spatialreg)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(purrr)
+library(knitr)
+
+set.seed(12345)
+
+# Show package versions
+packageVersion("sf")
+packageVersion("spdep")
+packageVersion("spatialreg")
+```
+
+# 3. Read the West Midlands dataset
+
+```{r read-data}
+# Project directory
+project_dir <- "D:/Spatial Data Analysis"
+
+# Input GeoPackage
+data_path <- file.path(
+  project_dir,
+  "efdi_wm_clean.gpkg"
+)
+
+# Confirm file exists
+if (!file.exists(data_path)) {
+  stop("The GeoPackage file could not be found.")
+}
+
+# Read spatial data
+food <- st_read(
+  data_path,
+  quiet = TRUE
+)
+
+# Inspect data
+head(food)
+
+# Number of observations
+nrow(food)
+
+# Column names
+names(food)
+
+# Geometry column name
+attr(food, "sf_column")
+
+# Data structure
+str(food)
+
+# Geometry type
+unique(st_geometry_type(food))
+
+# CRS
+st_crs(food)
+```
+
+# 4. Prepare the analytical dataset
+
+The active geometry column in this GeoPackage is `geom`, not `geometry`. The code below uses `st_geometry()` so that the spatial operations work with the active geometry column.
+
+```{r prepare-data}
+# Check original CRS
+st_crs(food)
+
+# Transform to British National Grid if necessary
+if (st_crs(food)$epsg != 27700) {
+  food <- st_transform(food, 27700)
+}
+
+# Check required columns
+required_fields <- c(
+  "lsoa01cd",
+  "efdi",
+  "geom"
+)
+
+missing_fields <- setdiff(
+  required_fields,
+  names(food)
+)
+
+if (length(missing_fields) > 0) {
+  stop(
+    paste(
+      "Missing required fields:",
+      paste(missing_fields, collapse = ", ")
+    )
+  )
+}
+
+# Retain observations with EFDI values
+food_analysis <- food %>%
+  filter(!is.na(efdi))
+
+# Remove empty geometries using the active geometry
+food_analysis <- food_analysis[
+  !st_is_empty(st_geometry(food_analysis)),
+]
+
+# Check unique LSOA identifiers
+stopifnot(
+  !anyDuplicated(food_analysis$lsoa01cd)
+)
+
+# Check and repair invalid geometries
+invalid <- !st_is_valid(food_analysis)
+
+if (any(invalid)) {
+  food_analysis <- st_make_valid(food_analysis)
+}
+
+# Verify analytical dataset
+cat("Observations:", nrow(food_analysis), "\n")
+cat("Missing EFDI:", sum(is.na(food_analysis$efdi)), "\n")
+cat("Empty geometries:",
+    sum(st_is_empty(st_geometry(food_analysis))), "\n")
+cat("Invalid geometries:",
+    sum(!st_is_valid(food_analysis)), "\n")
+cat("CRS:", st_crs(food_analysis)$epsg, "\n")
+
+# Inspect result
+head(food_analysis)
+```
+
+# 5. Create representative points
+
+Queen contiguity uses polygon boundaries. KNN and distance-based weights use representative locations.
+
+A representative point is generated inside each LSOA using `st_point_on_surface()`.
+
+```{r representative-points}
+# Generate one point inside each LSOA
+representative_points <- st_point_on_surface(
+  food_analysis
+)
+
+# Extract coordinates
+coords <- st_coordinates(
+  representative_points
+)
+
+# Check coordinates
+head(coords)
+
+# Number of points
+nrow(coords)
+
+# Confirm CRS
+st_crs(representative_points)
+```
+
+The coordinate system is EPSG:27700, so distances are measured in metres.
+
+# 6. Queen contiguity weights
+
+Queen contiguity defines two LSOAs as neighbours when their polygons share an edge or a corner.
+
+```{r queen-weights}
+nb_queen <- poly2nb(
+  food_analysis,
+  queen = TRUE,
+  row.names = food_analysis$lsoa01cd
+)
+
+# Inspect neighbour structure
+summary(nb_queen)
+
+# Number of neighbours per LSOA
+queen_counts <- card(nb_queen)
+
+# Descriptive statistics
+summary(queen_counts)
+
+# Islands
+sum(queen_counts == 0)
+
+# Create row-standardised weights
+lw_queen <- nb2listw(
+  nb_queen,
+  style = "W",
+  zero.policy = TRUE
+)
+
+# Inspect listw object
+summary(lw_queen)
+
+str(lw_queen, max.level = 2)
+```
+
+# 7. K-nearest neighbours (KNN6)
+
+KNN6 assigns six nearest representative points to every LSOA.
+
+Unlike Queen contiguity, the areas do not have to share a boundary.
+
+```{r knn6-weights}
+# Identify six nearest neighbours
+knn_result <- knearneigh(
+  coords,
+  k = 6,
+  longlat = FALSE
+)
+
+# Convert to neighbour list
+nb_knn6 <- knn2nb(
+  knn_result,
+  row.names = food_analysis$lsoa01cd
+)
+
+# Inspect neighbour structure
+summary(nb_knn6)
+
+# Number of neighbours
+knn_counts <- card(nb_knn6)
+
+# Descriptive statistics
+summary(knn_counts)
+
+# Create row-standardised weights
+lw_knn6 <- nb2listw(
+  nb_knn6,
+  style = "W",
+  zero.policy = TRUE
+)
+
+# Inspect listw object
+summary(lw_knn6)
+
+str(lw_knn6, max.level = 2)
+```
+
+# 8. Distance-band weights (6 km)
+
+The distance-band method connects LSOAs whose representative points are within 6,000 metres of one another.
+
+```{r distance-weights}
+# Create distance-band neighbours
+nb_dist6 <- dnearneigh(
+  coords,
+  d1 = 0,
+  d2 = 6000,
+  row.names = food_analysis$lsoa01cd,
+  longlat = FALSE
+)
+
+# Inspect neighbour structure
+summary(nb_dist6)
+
+# Number of neighbours
+dist6_counts <- card(nb_dist6)
+
+# Descriptive statistics
+summary(dist6_counts)
+
+# Check islands
+sum(dist6_counts == 0)
+
+# Create row-standardised weights
+lw_dist6 <- nb2listw(
+  nb_dist6,
+  style = "W",
+  zero.policy = TRUE
+)
+
+# Inspect listw object
+summary(lw_dist6)
+
+str(lw_dist6, max.level = 2)
+```
+
+# 9. Inverse-distance weights (6 km, power 1)
+
+This method uses the same 6 km neighbourhood definition but gives closer LSOAs greater weights.
+
+The inverse-distance relationship is:
+
+\[
+w_{ij} = \frac{1}{d_{ij}}
+\]
+
+where \(d_{ij}\) is the distance between representative points.
+
+```{r inverse-distance-weights}
+# Use the distance-band neighbour structure
+# and the representative points to calculate inverse distances.
+
+lw_idw6 <- nb2listwdist(
+  neighbours = nb_dist6,
+  x = representative_points,
+  type = "idw",
+  style = "W",
+  alpha = 1,
+  longlat = FALSE,
+  zero.policy = TRUE
+)
+
+# Inspect weights
+summary(lw_idw6)
+
+str(lw_idw6, max.level = 2)
+```
+
+`style = "W"` row-standardises the weights. `alpha = 1` applies inverse distance to the first power.
+
+# 10. Organise the four neighbour and weights objects
+
+```{r organise-weights}
+# Neighbour lists
+nb_objects <- list(
+  Queen = nb_queen,
+  KNN6 = nb_knn6,
+  Distance_6km = nb_dist6,
+  Inverse_Distance_6km = nb_dist6
+)
+
+# Spatial weights objects
+lw_objects <- list(
+  Queen = lw_queen,
+  KNN6 = lw_knn6,
+  Distance_6km = lw_dist6,
+  Inverse_Distance_6km = lw_idw6
+)
+
+# Check all four objects
+names(lw_objects)
+
+# Confirm observation counts
+sapply(lw_objects, function(x) length(x$neighbours))
+```
+
+# 11. Compare neighbour statistics
+
+```{r weights-summary}
+weights_summary <- map2_dfr(
+  nb_objects,
+  names(nb_objects),
+  function(nb, method) {
+
+    counts <- card(nb)
+
+    tibble(
+      Method = method,
+      Observations = length(nb),
+      Minimum_neighbours = min(counts),
+      Maximum_neighbours = max(counts),
+      Mean_neighbours = mean(counts),
+      Median_neighbours = median(counts),
+      Islands = sum(counts == 0)
+    )
+  }
+)
+
+knitr::kable(
+  weights_summary,
+  digits = 2,
+  caption = "Comparison of the four neighbour structures"
+)
+```
+
+# 12. Compare neighbour-count distributions
+
+```{r neighbour-distribution}
+neighbour_data <- map2_dfr(
+  nb_objects,
+  names(nb_objects),
+  function(nb, method) {
+
+    tibble(
+      Method = method,
+      Neighbours = card(nb)
+    )
+  }
+)
+
+ggplot(
+  neighbour_data,
+  aes(x = Neighbours)
+) +
+  geom_histogram(
+    binwidth = 1,
+    boundary = 0,
+    colour = "black",
+    fill = "steelblue"
+  ) +
+  facet_wrap(
+    ~ Method,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Neighbour-count distributions",
+    x = "Number of neighbours",
+    y = "Number of LSOAs"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.background = element_rect(fill = "white"),
+    panel.background = element_rect(fill = "white")
+  )
+```
+
+# 13. Map the neighbour counts
+
+```{r neighbour-maps, fig.width=10, fig.height=8}
+# Attach neighbour counts to the analytical data
+food_analysis$Queen <- card(nb_queen)
+food_analysis$KNN6 <- card(nb_knn6)
+food_analysis$Distance_6km <- card(nb_dist6)
+
+# Queen map
+ggplot(food_analysis) +
+  geom_sf(aes(fill = Queen), colour = NA) +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Queen contiguity: number of neighbours",
+    fill = "Neighbours"
+  ) +
+  theme_minimal()
+
+# KNN6 map
+ggplot(food_analysis) +
+  geom_sf(aes(fill = KNN6), colour = NA) +
+  scale_fill_viridis_c() +
+  labs(
+    title = "KNN6: number of neighbours",
+    fill = "Neighbours"
+  ) +
+  theme_minimal()
+
+# Distance-band map
+ggplot(food_analysis) +
+  geom_sf(aes(fill = Distance_6km), colour = NA) +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Distance band 6 km: number of neighbours",
+    fill = "Neighbours"
+  ) +
+  theme_minimal()
+```
+
+# 14. Compare the four spatial weights objects
+
+```{r listw-comparison}
+# Summary of each weights object
+for (method in names(lw_objects)) {
+
+  cat("\n====================================\n")
+  cat("SPATIAL WEIGHTS:", method, "\n")
+  cat("====================================\n")
+
+  print(summary(lw_objects[[method]]))
+}
+```
+
+# 15. Global Moran's I — analytical inference
+
+Global Moran's I measures the overall spatial autocorrelation of EFDI.
+
+The four methods use the same EFDI variable and observations, but different spatial weights.
+
+```{r global-moran-analytical}
+# EFDI values
+y <- food_analysis$efdi
+
+# Analytical Global Moran's I tests
+global_tests <- lapply(
+  lw_objects,
+  function(lw) {
+
+    moran.test(
+      y,
+      lw,
+      randomisation = TRUE,
+      zero.policy = TRUE
+    )
+  }
+)
+
+# Extract results
+global_summary <- map2_dfr(
+  global_tests,
+  names(global_tests),
+  function(test, method) {
+
+    tibble(
+      Method = method,
+      Moran_I = as.numeric(test$estimate[1]),
+      Expected_I = as.numeric(test$estimate[2]),
+      Variance = as.numeric(test$estimate[3]),
+      Statistic = as.numeric(test$statistic),
+      P_value = test$p.value
+    )
+  }
+)
+
+knitr::kable(
+  global_summary,
+  digits = 6,
+  caption = "Global Moran's I — analytical inference"
+)
+```
+
+# 16. Global Moran's I — permutation inference
+
+The permutation test compares the observed Global Moran's I with values generated by randomly reallocating EFDI values across the fixed spatial weights.
+
+```{r global-moran-permutation}
+set.seed(12345)
+
+global_permutation <- lapply(
+  lw_objects,
+  function(lw) {
+
+    moran.mc(
+      y,
+      lw,
+      nsim = 999,
+      zero.policy = TRUE
+    )
+  }
+)
+
+permutation_summary <- map2_dfr(
+  global_permutation,
+  names(global_permutation),
+  function(test, method) {
+
+    tibble(
+      Method = method,
+      Moran_I = as.numeric(test$statistic),
+      P_value = test$p.value,
+      Permutations = 999
+    )
+  }
+)
+
+knitr::kable(
+  permutation_summary,
+  digits = 6,
+  caption = "Global Moran's I — permutation inference"
+)
+```
+
+# 17. Map EFDI distribution
+
+```{r efdi-map, fig.width=9, fig.height=8}
+ggplot(food_analysis) +
+  geom_sf(
+    aes(fill = efdi),
+    colour = NA
+  ) +
+  scale_fill_viridis_c(
+    option = "viridis",
+    name = "EFDI"
+  ) +
+  labs(
+    title = "E-food Desert Index across the West Midlands",
+    subtitle = "2,365 LSOAs"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.background = element_rect(fill = "white"),
+    panel.background = element_rect(fill = "white")
+  )
+```
+
+# 18. Local Moran's I — LISA analysis
+
+Local Moran's I identifies local spatial clusters and spatial outliers.
+
+The analysis calculates:
+
+- Local Moran's I
+- Expected local Moran's I
+- Local variance
+- Z-score
+- Analytical p-value
+- Spatial lag
+- Quadrant classification
+
+```{r lisa-function}
+calculate_lisa <- function(data, y, lw) {
+
+  # Local Moran's I
+  lisa <- localmoran(
+    y,
+    lw,
+    zero.policy = TRUE
+  )
+
+  # Standardised EFDI
+  z <- as.numeric(scale(y))
+
+  # Spatial lag of standardised EFDI
+  lag_z <- lag.listw(
+    lw,
+    z,
+    zero.policy = TRUE
+  )
+
+  # Quadrant classification
+  quadrant <- case_when(
+    z >= 0 & lag_z >= 0 ~ "High-High",
+    z < 0 & lag_z < 0 ~ "Low-Low",
+    z < 0 & lag_z >= 0 ~ "Low-High",
+    z >= 0 & lag_z < 0 ~ "High-Low"
+  )
+
+  # Store local Moran results
+  output <- data %>%
+    mutate(
+      local_I = lisa[, "Ii"],
+      expected_local_I = lisa[, "E.Ii"],
+      local_variance = lisa[, "Var.Ii"],
+      local_Z = lisa[, "Z.Ii"],
+      local_p = lisa[, "Pr(z != E(Ii))"],
+      spatial_lag = lag_z,
+      quadrant = quadrant,
+      cluster = ifelse(
+        local_p < 0.05,
+        quadrant,
+        "Not significant"
+      )
+    )
+
+  output
+}
+```
+
+# 19. Run Local Moran's I for all four methods
+
+```{r lisa-four-methods}
+lisa_results <- lapply(
+  lw_objects,
+  function(lw) {
+
+    calculate_lisa(
+      food_analysis,
+      y,
+      lw
+    )
+  }
+)
+
+names(lisa_results) <- names(lw_objects)
+
+# Inspect Queen results
+head(
+  lisa_results$Queen %>%
+    st_drop_geometry() %>%
+    select(
+      lsoa01cd,
+      efdi,
+      local_I,
+      expected_local_I,
+      local_variance,
+      local_Z,
+      local_p,
+      quadrant,
+      cluster
+    )
+)
+```
+
+# 20. Compare Local Moran's I cluster counts
+
+```{r lisa-counts}
+lisa_counts <- map2_dfr(
+  lisa_results,
+  names(lisa_results),
+  function(data, method) {
+
+    data %>%
+      st_drop_geometry() %>%
+      count(cluster) %>%
+      mutate(Method = method)
+  }
+) %>%
+  select(
+    Method,
+    cluster,
+    n
+  )
+
+knitr::kable(
+  lisa_counts,
+  caption = "LISA cluster counts by spatial weights"
+)
+```
+
+# 21. Create LISA cluster maps
+
+```{r lisa-maps, fig.width=10, fig.height=8}
+cluster_colours <- c(
+  "High-High" = "#d7191c",
+  "Low-Low" = "#2c7bb6",
+  "Low-High" = "#abd9e9",
+  "High-Low" = "#fdae61",
+  "Not significant" = "#eeeeee"
+)
+
+for (method in names(lisa_results)) {
+
+  p <- ggplot(lisa_results[[method]]) +
+    geom_sf(
+      aes(fill = cluster),
+      colour = NA
+    ) +
+    scale_fill_manual(
+      values = cluster_colours,
+      drop = FALSE
+    ) +
+    labs(
+      title = paste(
+        "Local Moran's I clusters —",
+        method
+      ),
+      fill = "LISA classification"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.background = element_rect(fill = "white"),
+      panel.background = element_rect(fill = "white")
+    )
+
+  print(p)
+}
+```
+
+# 22. Map Local Moran's I values
+
+```{r local-i-map, fig.width=9, fig.height=8}
+ggplot(lisa_results$Queen) +
+  geom_sf(
+    aes(fill = local_I),
+    colour = NA
+  ) +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red"
+  ) +
+  labs(
+    title = "Local Moran's I — Queen weights",
+    fill = "Local I"
+  ) +
+  theme_minimal()
+```
+
+# 23. Map local variance
+
+```{r local-variance-map, fig.width=9, fig.height=8}
+ggplot(lisa_results$Queen) +
+  geom_sf(
+    aes(fill = local_variance),
+    colour = NA
+  ) +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Local variance of Moran's I — Queen weights",
+    fill = "Variance"
+  ) +
+  theme_minimal()
+```
+
+# 24. Export analytical results
+
+```{r export-results}
+# Export LISA results for all four methods
+for (method in names(lisa_results)) {
+
+  output_path <- file.path(
+    project_dir,
+    paste0(
+      "efdi_lisa_",
+      tolower(method),
+      ".gpkg"
+    )
+  )
+
+  st_write(
+    lisa_results[[method]],
+    output_path,
+    delete_dsn = TRUE,
+    quiet = TRUE
+  )
+}
+
+# Export Global Moran analytical results
+write.csv(
+  global_summary,
+  file.path(
+    project_dir,
+    "global_moran_analytical.csv"
+  ),
+  row.names = FALSE
+)
+
+# Export Global Moran permutation results
+write.csv(
+  permutation_summary,
+  file.path(
+    project_dir,
+    "global_moran_permutation.csv"
+  ),
+  row.names = FALSE
+)
+
+# Export LISA cluster counts
+write.csv(
+  lisa_counts,
+  file.path(
+    project_dir,
+    "lisa_cluster_comparison.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+# 25. Final comparison and interpretation
+
+The four weighting methods represent different assumptions about spatial relationships.
+
+| Method | Neighbour definition | Main characteristic |
+|---|---|---|
+| Queen | Shared edge or corner | Physical polygon contiguity |
+| KNN6 | Six nearest representative points | Fixed number of neighbours |
+| Distance band | Representative points within 6 km | Variable number of neighbours |
+| Inverse distance | Within 6 km, weighted by inverse distance | Closer locations receive greater weights |
+
+Compare the following:
+
+1. How the number of neighbours differs between methods.
+2. Whether Global Moran's I changes between weighting methods.
+3. Whether permutation tests support the same conclusion.
+4. Whether High–High and Low–Low clusters occur in similar locations.
+5. Whether local spatial outliers change.
+6. Which weighting method best represents the spatial interaction process relevant to EFDI.
+
+The final methodological choice should be justified by the nature of the EFDI application, not simply by selecting the method with the largest Moran's I.
+
+# 26. Important methodological notes
+
+- The analytical dataset contains 2,365 LSOAs with EFDI values.
+- The coordinate reference system is EPSG:27700.
+- The active geometry column is `geom`.
+- The four methods use the same observations and EFDI variable.
+- KNN6 and distance-band neighbours are based on representative points.
+- Inverse-distance weights use the same 6 km neighbourhood definition and power 1.
+- All four weights objects are row-standardised using style `"W"`.
+- Global Moran's I analytical and permutation tests are reported separately.
+- Local Moran's I in this document uses analytical p-values from `localmoran()`. These are not the same as Python's permutation-based local p-values.
+- Local p-values use an unadjusted 0.05 threshold. Consider multiple-testing correction before making strong claims about individual LSOAs.
+- Results should be interpreted only after successfully running the code and checking the outputs.

@@ -1,0 +1,21 @@
+# library(sf)
+# efdi <- st_read("efdi_west_midlands/efdi_west_midlands.shp")
+# names(efdi)
+# 
+# print(names(efdi))
+# # print(summary(efdi))
+# #summary(efdi)
+# #hist(efdi$efdi)
+
+
+# library(sf)
+# efdi <- st_read("efdi_west_midlands/efdi_west_midlands.shp")
+# 
+# plot(efdi["efdi"],
+#      breaks = "quantile", nbreaks = 5,
+#      pal = hcl.colors(5, "Reds", rev = TRUE),
+#      border = "grey40", lwd = 0.1,
+#      main = "e-food desert index (quantiles)")
+
+
+View(st_drop_geometry(efdi))

@@ -1,0 +1,23 @@
+"Method","cluster","n"
+"Queen","High-High",263
+"Queen","High-Low",14
+"Queen","Low-High",25
+"Queen","Low-Low",218
+"Queen","Not significant",1845
+"KNN6","High-High",278
+"KNN6","High-Low",24
+"KNN6","Low-High",32
+"KNN6","Low-Low",289
+"KNN6","Not significant",1742
+"Distance_6km","High-High",524
+"Distance_6km","High-Low",194
+"Distance_6km","Low-High",321
+"Distance_6km","Low-Low",616
+"Distance_6km","Not significant",709
+"Distance_6km",NA,1
+"Inverse_Distance_6km","High-High",515
+"Inverse_Distance_6km","High-Low",167
+"Inverse_Distance_6km","Low-High",203
+"Inverse_Distance_6km","Low-Low",646
+"Inverse_Distance_6km","Not significant",833
+"Inverse_Distance_6km",NA,1
